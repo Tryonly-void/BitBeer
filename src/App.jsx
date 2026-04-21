@@ -1,32 +1,45 @@
 import { useEffect, useMemo, useState } from "react";
 import "./App.css";
-
-const STORAGE_KEY = "bierkasse_app_v1";
-const DEFAULT_PRICE = 2;
-const TWINT_NUMBER = "0794826733";
-const ADMIN_PASSWORD = "bier123";
-
-const defaultState = {
-  pricePerBeer: DEFAULT_PRICE,
-  members: [
-    { id: crypto.randomUUID(), name: "Selim", beers: 0, paidAmount: 0 },
-    { id: crypto.randomUUID(), name: "Mitarbeiter 2", beers: 0, paidAmount: 0 },
-    { id: crypto.randomUUID(), name: "Mitarbeiter 3", beers: 0, paidAmount: 0 },
-  ],
-  transactions: [],
-  stock: 24,
-};
+import { db, auth } from "./firebase";
+import {
+  addDoc,
+  collection,
+  deleteDoc,
+  doc,
+  getDoc,
+  onSnapshot,
+  orderBy,
+  query,
+  runTransaction,
+  serverTimestamp,
+  updateDoc,
+} from "firebase/firestore";
+import {
+  onAuthStateChanged,
+  signInWithEmailAndPassword,
+  signOut,
+} from "firebase/auth";
 
 function formatCHF(value) {
   return new Intl.NumberFormat("de-CH", {
     style: "currency",
     currency: "CHF",
     minimumFractionDigits: 2,
-  }).format(value);
+  }).format(Number(value || 0));
 }
 
-function todayDateTime() {
-  return new Date().toLocaleString("de-CH");
+function formatDate(value) {
+  if (!value) return "-";
+
+  try {
+    if (typeof value?.toDate === "function") {
+      return value.toDate().toLocaleString("de-CH");
+    }
+
+    return new Date(value).toLocaleString("de-CH");
+  } catch {
+    return "-";
+  }
 }
 
 function StatCard({ title, value }) {
@@ -48,222 +61,234 @@ function MiniInfo({ label, value }) {
 }
 
 export default function App() {
-  const [data, setData] = useState(defaultState);
+  const [products, setProducts] = useState([]);
+  const [members, setMembers] = useState([]);
+  const [transactions, setTransactions] = useState([]);
+  const [settings, setSettings] = useState({ twintNumber: "0794826733" });
+
   const [selectedMemberId, setSelectedMemberId] = useState("");
+  const [selectedProductId, setSelectedProductId] = useState("");
   const [newMemberName, setNewMemberName] = useState("");
   const [stockToAdd, setStockToAdd] = useState("");
   const [stockToRemove, setStockToRemove] = useState("");
   const [copied, setCopied] = useState(false);
   const [activeTab, setActiveTab] = useState("mitarbeiter");
-  const [isAdminAuth, setIsAdminAuth] = useState(false);
+
+  const [adminEmail, setAdminEmail] = useState("");
   const [adminPasswordInput, setAdminPasswordInput] = useState("");
+  const [isAdminAuth, setIsAdminAuth] = useState(false);
+  const [adminUid, setAdminUid] = useState(null);
+
+  const [loading, setLoading] = useState(true);
+
+  const activeProducts = useMemo(
+    () => products.filter((product) => product.active !== false),
+    [products]
+  );
 
   useEffect(() => {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) {
-      try {
-        const parsed = JSON.parse(raw);
-        setData(parsed);
-      } catch {
-        localStorage.removeItem(STORAGE_KEY);
+    const unsubscribeProducts = onSnapshot(
+      query(collection(db, "products"), orderBy("sortOrder", "asc")),
+      (snapshot) => {
+        const list = snapshot.docs.map((item) => ({
+          id: item.id,
+          ...item.data(),
+        }));
+        setProducts(list);
       }
-    }
+    );
+
+    const unsubscribeMembers = onSnapshot(
+      query(collection(db, "members"), orderBy("name", "asc")),
+      (snapshot) => {
+        const list = snapshot.docs.map((item) => ({
+          id: item.id,
+          ...item.data(),
+        }));
+        setMembers(list);
+      }
+    );
+
+    const unsubscribeTransactions = onSnapshot(
+      query(collection(db, "transactions"), orderBy("createdAt", "desc")),
+      (snapshot) => {
+        const list = snapshot.docs.map((item) => ({
+          id: item.id,
+          ...item.data(),
+        }));
+        setTransactions(list);
+        setLoading(false);
+      }
+    );
+
+    const unsubscribeSettings = onSnapshot(doc(db, "settings", "general"), (snapshot) => {
+      if (snapshot.exists()) {
+        setSettings({
+          twintNumber: snapshot.data().twintNumber || "0794826733",
+        });
+      }
+    });
+
+    return () => {
+      unsubscribeProducts();
+      unsubscribeMembers();
+      unsubscribeTransactions();
+      unsubscribeSettings();
+    };
   }, []);
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-  }, [data]);
+    if (!selectedMemberId && members.length > 0) {
+      setSelectedMemberId(members[0].id);
+    }
+  }, [members, selectedMemberId]);
 
   useEffect(() => {
-    if (!selectedMemberId && data.members.length > 0) {
-      setSelectedMemberId(data.members[0].id);
+    if (!selectedProductId && activeProducts.length > 0) {
+      setSelectedProductId(activeProducts[0].id);
     }
-  }, [data.members, selectedMemberId]);
+  }, [activeProducts, selectedProductId]);
+
+  useEffect(() => {
+    const unsubscribeAuth = onAuthStateChanged(auth, async (user) => {
+      if (!user) {
+        setIsAdminAuth(false);
+        setAdminUid(null);
+        return;
+      }
+
+      try {
+        const adminDoc = await getDoc(doc(db, "admins", user.uid));
+        if (adminDoc.exists()) {
+          setIsAdminAuth(true);
+          setAdminUid(user.uid);
+        } else {
+          setIsAdminAuth(false);
+          setAdminUid(null);
+        }
+      } catch {
+        setIsAdminAuth(false);
+        setAdminUid(null);
+      }
+    });
+
+    return () => unsubscribeAuth();
+  }, []);
+
+  const memberStatsMap = useMemo(() => {
+    const map = {};
+
+    for (const member of members) {
+      map[member.id] = {
+        beers: 0,
+        total: 0,
+        paidAmount: 0,
+        open: 0,
+      };
+    }
+
+    for (const tx of transactions) {
+      const memberId = tx.memberId;
+      if (!memberId) continue;
+
+      if (!map[memberId]) {
+        map[memberId] = {
+          beers: 0,
+          total: 0,
+          paidAmount: 0,
+          open: 0,
+        };
+      }
+
+      if (tx.type === "purchase") {
+        map[memberId].beers += Number(tx.quantity || 0);
+        map[memberId].total += Number(tx.total || 0);
+      }
+
+      if (tx.type === "payment") {
+        map[memberId].paidAmount += Number(tx.total || 0);
+      }
+
+      if (tx.type === "correction") {
+        map[memberId].beers -= Number(tx.quantity || 0);
+        map[memberId].total -= Math.abs(Number(tx.total || 0));
+      }
+
+      if (tx.type === "reset") {
+        map[memberId] = {
+          beers: 0,
+          total: 0,
+          paidAmount: 0,
+          open: 0,
+        };
+      }
+    }
+
+    for (const memberId of Object.keys(map)) {
+      map[memberId].beers = Math.max(0, map[memberId].beers);
+      map[memberId].total = Math.max(0, map[memberId].total);
+      map[memberId].paidAmount = Math.max(0, map[memberId].paidAmount);
+      map[memberId].open = Math.max(0, map[memberId].total - map[memberId].paidAmount);
+    }
+
+    return map;
+  }, [members, transactions]);
+
+  const currentMember = members.find((m) => m.id === selectedMemberId);
+  const currentProduct = products.find((p) => p.id === selectedProductId);
+  const currentMemberStats = currentMember
+    ? memberStatsMap[currentMember.id] || { beers: 0, total: 0, paidAmount: 0, open: 0 }
+    : { beers: 0, total: 0, paidAmount: 0, open: 0 };
 
   const totalOpen = useMemo(() => {
-    return data.members.reduce((sum, member) => {
-      const due = member.beers * data.pricePerBeer - member.paidAmount;
-      return sum + Math.max(0, due);
-    }, 0);
-  }, [data]);
+    return Object.values(memberStatsMap).reduce(
+      (sum, entry) => sum + Number(entry.open || 0),
+      0
+    );
+  }, [memberStatsMap]);
 
   const totalBeers = useMemo(() => {
-    return data.members.reduce((sum, member) => sum + member.beers, 0);
-  }, [data.members]);
+    return Object.values(memberStatsMap).reduce(
+      (sum, entry) => sum + Number(entry.beers || 0),
+      0
+    );
+  }, [memberStatsMap]);
 
-  const currentMember = data.members.find((m) => m.id === selectedMemberId);
+  const totalStock = useMemo(() => {
+    return products.reduce((sum, product) => sum + Number(product.stock || 0), 0);
+  }, [products]);
 
-  const addBeer = (memberId) => {
-    setData((prev) => ({
-      ...prev,
-      stock: Math.max(0, prev.stock - 1),
-      members: prev.members.map((member) =>
-        member.id === memberId ? { ...member, beers: member.beers + 1 } : member
-      ),
-      transactions: [
-        {
-          id: crypto.randomUUID(),
-          type: "beer",
-          memberId,
-          amount: prev.pricePerBeer,
-          text: "1 Bier hinzugefügt",
-          date: todayDateTime(),
-        },
-        ...prev.transactions,
-      ],
-    }));
-  };
+  const handleAdminLogin = async () => {
+    if (!adminEmail.trim() || !adminPasswordInput.trim()) {
+      alert("Bitte E-Mail und Passwort eingeben.");
+      return;
+    }
 
-  const removeBeer = (memberId) => {
-    const member = data.members.find((m) => m.id === memberId);
-    if (!member || member.beers <= 0) return;
-
-    setData((prev) => ({
-      ...prev,
-      stock: prev.stock + 1,
-      members: prev.members.map((m) =>
-        m.id === memberId ? { ...m, beers: Math.max(0, m.beers - 1) } : m
-      ),
-      transactions: [
-        {
-          id: crypto.randomUUID(),
-          type: "correction",
-          memberId,
-          amount: -prev.pricePerBeer,
-          text: "1 Bier entfernt",
-          date: todayDateTime(),
-        },
-        ...prev.transactions,
-      ],
-    }));
-  };
-
-  const markPaid = (memberId) => {
-    setData((prev) => {
-      const member = prev.members.find((m) => m.id === memberId);
-      if (!member) return prev;
-
-      const totalDue = member.beers * prev.pricePerBeer;
-      const payment = Math.max(0, totalDue - member.paidAmount);
-
-      return {
-        ...prev,
-        members: prev.members.map((m) =>
-          m.id === memberId ? { ...m, paidAmount: totalDue } : m
-        ),
-        transactions: [
-          {
-            id: crypto.randomUUID(),
-            type: "payment",
-            memberId,
-            amount: payment,
-            text: "Als bezahlt markiert",
-            date: todayDateTime(),
-          },
-          ...prev.transactions,
-        ],
-      };
-    });
-  };
-
-  const resetMember = (memberId) => {
-    setData((prev) => ({
-      ...prev,
-      members: prev.members.map((m) =>
-        m.id === memberId ? { ...m, beers: 0, paidAmount: 0 } : m
-      ),
-      transactions: [
-        {
-          id: crypto.randomUUID(),
-          type: "reset",
-          memberId,
-          amount: 0,
-          text: "Konto zurückgesetzt",
-          date: todayDateTime(),
-        },
-        ...prev.transactions,
-      ],
-    }));
-  };
-
-  const addMember = () => {
-    const name = newMemberName.trim();
-    if (!name) return;
-
-    const newMember = { id: crypto.randomUUID(), name, beers: 0, paidAmount: 0 };
-    setData((prev) => ({ ...prev, members: [...prev.members, newMember] }));
-    setNewMemberName("");
-    setSelectedMemberId(newMember.id);
-  };
-
-  const deleteMember = (memberId) => {
-    setData((prev) => ({
-      ...prev,
-      members: prev.members.filter((m) => m.id !== memberId),
-      transactions: prev.transactions.filter((t) => t.memberId !== memberId),
-    }));
-  };
-
-  const addStock = () => {
-    const value = Number(stockToAdd);
-    if (!Number.isFinite(value) || value <= 0) return;
-
-    setData((prev) => ({
-      ...prev,
-      stock: prev.stock + value,
-      transactions: [
-        {
-          id: crypto.randomUUID(),
-          type: "stock",
-          amount: 0,
-          text: `Bestand um ${value} erhöht`,
-          date: todayDateTime(),
-        },
-        ...prev.transactions,
-      ],
-    }));
-
-    setStockToAdd("");
-  };
-
-  const removeStock = () => {
-    const value = Number(stockToRemove);
-    if (!Number.isFinite(value) || value <= 0) return;
-
-    setData((prev) => ({
-      ...prev,
-      stock: Math.max(0, prev.stock - value),
-      transactions: [
-        {
-          id: crypto.randomUUID(),
-          type: "stock",
-          amount: 0,
-          text: `Bestand um ${Math.min(value, prev.stock)} reduziert`,
-          date: todayDateTime(),
-        },
-        ...prev.transactions,
-      ],
-    }));
-
-    setStockToRemove("");
-  };
-
-  const handleAdminLogin = () => {
-    if (adminPasswordInput === ADMIN_PASSWORD) {
-      setIsAdminAuth(true);
+    try {
+      await signInWithEmailAndPassword(auth, adminEmail.trim(), adminPasswordInput);
       setAdminPasswordInput("");
-    } else {
-      alert("Falsches Passwort");
+    } catch (error) {
+      alert(`Login fehlgeschlagen: ${error.message}`);
+    }
+  };
+
+  const handleAdminLogout = async () => {
+    try {
+      await signOut(auth);
+      setIsAdminAuth(false);
+      setAdminUid(null);
+    } catch (error) {
+      alert(`Logout fehlgeschlagen: ${error.message}`);
     }
   };
 
   const copyTwint = async () => {
     try {
       if (navigator.clipboard && window.isSecureContext) {
-        await navigator.clipboard.writeText(TWINT_NUMBER);
+        await navigator.clipboard.writeText(settings.twintNumber || "");
       } else {
         const textArea = document.createElement("textarea");
-        textArea.value = TWINT_NUMBER;
+        textArea.value = settings.twintNumber || "";
         textArea.style.position = "fixed";
         textArea.style.left = "-9999px";
         document.body.appendChild(textArea);
@@ -275,9 +300,334 @@ export default function App() {
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     } catch {
-      alert(`Bitte Nummer manuell kopieren: ${TWINT_NUMBER}`);
+      alert(`Bitte Nummer manuell kopieren: ${settings.twintNumber || ""}`);
     }
   };
+
+  const addBeer = async (memberId) => {
+    const member = members.find((m) => m.id === memberId);
+    const product = products.find((p) => p.id === selectedProductId);
+
+    if (!member) {
+      alert("Bitte einen Mitarbeiter auswählen.");
+      return;
+    }
+
+    if (!product) {
+      alert("Bitte ein Produkt auswählen.");
+      return;
+    }
+
+    if (Number(product.stock || 0) <= 0) {
+      alert("Dieses Produkt ist nicht mehr auf Lager.");
+      return;
+    }
+
+    try {
+      await runTransaction(db, async (transaction) => {
+        const productRef = doc(db, "products", product.id);
+        const freshProductSnap = await transaction.get(productRef);
+
+        if (!freshProductSnap.exists()) {
+          throw new Error("Produkt nicht gefunden.");
+        }
+
+        const freshProduct = freshProductSnap.data();
+        const currentStock = Number(freshProduct.stock || 0);
+
+        if (currentStock <= 0) {
+          throw new Error("Dieses Produkt ist nicht mehr auf Lager.");
+        }
+
+        transaction.update(productRef, {
+          stock: currentStock - 1,
+        });
+
+        const txRef = doc(collection(db, "transactions"));
+        transaction.set(txRef, {
+          memberId: member.id,
+          memberName: member.name,
+          productId: product.id,
+          productName: freshProduct.name,
+          quantity: 1,
+          unitPrice: Number(freshProduct.price || 0),
+          total: Number(freshProduct.price || 0),
+          type: "purchase",
+          createdAt: serverTimestamp(),
+          createdBy: auth.currentUser?.uid || null,
+        });
+      });
+    } catch (error) {
+      alert(`Buchung fehlgeschlagen: ${error.message}`);
+    }
+  };
+
+  const removeBeer = async (memberId) => {
+    if (!isAdminAuth) {
+      alert("Nur Admins dürfen Korrekturen machen.");
+      return;
+    }
+
+    const member = members.find((m) => m.id === memberId);
+    const product = products.find((p) => p.id === selectedProductId);
+    const stats = memberStatsMap[memberId];
+
+    if (!member || !product) return;
+
+    if (!stats || Number(stats.beers || 0) <= 0) {
+      alert("Für diesen Mitarbeiter gibt es nichts zu korrigieren.");
+      return;
+    }
+
+    try {
+      await runTransaction(db, async (transaction) => {
+        const productRef = doc(db, "products", product.id);
+        const freshProductSnap = await transaction.get(productRef);
+
+        if (!freshProductSnap.exists()) {
+          throw new Error("Produkt nicht gefunden.");
+        }
+
+        const freshProduct = freshProductSnap.data();
+        const currentStock = Number(freshProduct.stock || 0);
+
+        transaction.update(productRef, {
+          stock: currentStock + 1,
+        });
+
+        const txRef = doc(collection(db, "transactions"));
+        transaction.set(txRef, {
+          memberId: member.id,
+          memberName: member.name,
+          productId: product.id,
+          productName: freshProduct.name,
+          quantity: 1,
+          unitPrice: Number(freshProduct.price || 0),
+          total: Number(freshProduct.price || 0),
+          type: "correction",
+          createdAt: serverTimestamp(),
+          createdBy: adminUid,
+        });
+      });
+    } catch (error) {
+      alert(`Korrektur fehlgeschlagen: ${error.message}`);
+    }
+  };
+
+  const markPaid = async (memberId) => {
+    if (!isAdminAuth) {
+      alert("Nur Admins dürfen Zahlungen markieren.");
+      return;
+    }
+
+    const member = members.find((m) => m.id === memberId);
+    const stats = memberStatsMap[memberId];
+
+    if (!member || !stats) return;
+
+    if (Number(stats.open || 0) <= 0) {
+      alert("Für diesen Mitarbeiter ist nichts offen.");
+      return;
+    }
+
+    try {
+      await addDoc(collection(db, "transactions"), {
+        memberId: member.id,
+        memberName: member.name,
+        quantity: 0,
+        unitPrice: 0,
+        total: Number(stats.open || 0),
+        type: "payment",
+        createdAt: serverTimestamp(),
+        createdBy: adminUid,
+      });
+    } catch (error) {
+      alert(`Zahlung konnte nicht gespeichert werden: ${error.message}`);
+    }
+  };
+
+  const resetMember = async (memberId) => {
+    if (!isAdminAuth) {
+      alert("Nur Admins dürfen zurücksetzen.");
+      return;
+    }
+
+    const member = members.find((m) => m.id === memberId);
+    if (!member) return;
+
+    const confirmed = window.confirm(
+      `${member.name} wirklich zurücksetzen? Offene Beträge und Statistik werden danach auf 0 dargestellt.`
+    );
+
+    if (!confirmed) return;
+
+    try {
+      await addDoc(collection(db, "transactions"), {
+        memberId: member.id,
+        memberName: member.name,
+        quantity: 0,
+        unitPrice: 0,
+        total: 0,
+        type: "reset",
+        createdAt: serverTimestamp(),
+        createdBy: adminUid,
+      });
+    } catch (error) {
+      alert(`Reset fehlgeschlagen: ${error.message}`);
+    }
+  };
+
+  const addMember = async () => {
+    if (!isAdminAuth) {
+      alert("Nur Admins dürfen Mitglieder anlegen.");
+      return;
+    }
+
+    const name = newMemberName.trim();
+    if (!name) return;
+
+    try {
+      const ref = await addDoc(collection(db, "members"), {
+        name,
+        active: true,
+        createdAt: serverTimestamp(),
+      });
+
+      setNewMemberName("");
+      setSelectedMemberId(ref.id);
+    } catch (error) {
+      alert(`Mitglied konnte nicht erstellt werden: ${error.message}`);
+    }
+  };
+
+  const deleteMember = async (memberId) => {
+    if (!isAdminAuth) {
+      alert("Nur Admins dürfen Mitglieder löschen.");
+      return;
+    }
+
+    const member = members.find((m) => m.id === memberId);
+    if (!member) return;
+
+    const confirmed = window.confirm(`${member.name} wirklich löschen?`);
+    if (!confirmed) return;
+
+    try {
+      await deleteDoc(doc(db, "members", memberId));
+    } catch (error) {
+      alert(`Mitglied konnte nicht gelöscht werden: ${error.message}`);
+    }
+  };
+
+  const addStock = async () => {
+    if (!isAdminAuth) {
+      alert("Nur Admins dürfen den Bestand ändern.");
+      return;
+    }
+
+    const value = Number(stockToAdd);
+    if (!Number.isFinite(value) || value <= 0) return;
+
+    const product = products.find((p) => p.id === selectedProductId);
+    if (!product) {
+      alert("Bitte ein Produkt auswählen.");
+      return;
+    }
+
+    try {
+      await updateDoc(doc(db, "products", product.id), {
+        stock: Number(product.stock || 0) + value,
+      });
+
+      await addDoc(collection(db, "transactions"), {
+        memberId: null,
+        memberName: "Admin",
+        productId: product.id,
+        productName: product.name,
+        quantity: value,
+        unitPrice: 0,
+        total: 0,
+        type: "stock_add",
+        createdAt: serverTimestamp(),
+        createdBy: adminUid,
+      });
+
+      setStockToAdd("");
+    } catch (error) {
+      alert(`Bestand konnte nicht erhöht werden: ${error.message}`);
+    }
+  };
+
+  const removeStock = async () => {
+    if (!isAdminAuth) {
+      alert("Nur Admins dürfen den Bestand ändern.");
+      return;
+    }
+
+    const value = Number(stockToRemove);
+    if (!Number.isFinite(value) || value <= 0) return;
+
+    const product = products.find((p) => p.id === selectedProductId);
+    if (!product) {
+      alert("Bitte ein Produkt auswählen.");
+      return;
+    }
+
+    try {
+      const nextStock = Math.max(0, Number(product.stock || 0) - value);
+
+      await updateDoc(doc(db, "products", product.id), {
+        stock: nextStock,
+      });
+
+      await addDoc(collection(db, "transactions"), {
+        memberId: null,
+        memberName: "Admin",
+        productId: product.id,
+        productName: product.name,
+        quantity: Math.min(value, Number(product.stock || 0)),
+        unitPrice: 0,
+        total: 0,
+        type: "stock_remove",
+        createdAt: serverTimestamp(),
+        createdBy: adminUid,
+      });
+
+      setStockToRemove("");
+    } catch (error) {
+      alert(`Bestand konnte nicht reduziert werden: ${error.message}`);
+    }
+  };
+
+  const updateProductPrice = async (productId, newPrice) => {
+    if (!isAdminAuth) {
+      alert("Nur Admins dürfen Preise ändern.");
+      return;
+    }
+
+    const parsed = Number(newPrice);
+    if (!Number.isFinite(parsed) || parsed < 0) return;
+
+    try {
+      await updateDoc(doc(db, "products", productId), {
+        price: parsed,
+      });
+    } catch (error) {
+      alert(`Preis konnte nicht geändert werden: ${error.message}`);
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="page">
+        <div className="container">
+          <div className="card">
+            <h2>Lade Bierkasse...</h2>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="page">
@@ -285,13 +635,13 @@ export default function App() {
         <div className="topbar">
           <div>
             <h1>Bierkasse</h1>
-            <p className="subtitle">Einfache interne Web-App für den Betrieb</p>
+            <p className="subtitle">Gemeinsame Firebase-Web-App für den Betrieb</p>
           </div>
 
           <div className="card twint-box">
             <div className="twint-label">TWINT</div>
             <div className="twint-row">
-              <strong>{TWINT_NUMBER}</strong>
+              <strong>{settings.twintNumber || "-"}</strong>
               <button className="btn btn-outline" onClick={copyTwint}>
                 {copied ? "Kopiert" : "Kopieren"}
               </button>
@@ -300,8 +650,8 @@ export default function App() {
         </div>
 
         <div className="stats-grid">
-          <StatCard title="Preis pro Bier" value={formatCHF(data.pricePerBeer)} />
-          <StatCard title="Mitglieder" value={String(data.members.length)} />
+          <StatCard title="Produkte" value={String(activeProducts.length)} />
+          <StatCard title="Mitglieder" value={String(members.length)} />
           <StatCard title="Konsumierte Bier" value={String(totalBeers)} />
           <StatCard title="Offener Gesamtbetrag" value={formatCHF(totalOpen)} />
         </div>
@@ -338,9 +688,22 @@ export default function App() {
                 value={selectedMemberId}
                 onChange={(e) => setSelectedMemberId(e.target.value)}
               >
-                {data.members.map((member) => (
+                {members.map((member) => (
                   <option key={member.id} value={member.id}>
                     {member.name}
+                  </option>
+                ))}
+              </select>
+
+              <label className="label">Produkt auswählen</label>
+              <select
+                className="input"
+                value={selectedProductId}
+                onChange={(e) => setSelectedProductId(e.target.value)}
+              >
+                {activeProducts.map((product) => (
+                  <option key={product.id} value={product.id}>
+                    {product.name} · {formatCHF(product.price)} · Bestand {product.stock || 0}
                   </option>
                 ))}
               </select>
@@ -349,24 +712,13 @@ export default function App() {
                 <div className="member-box">
                   <div className="member-header">
                     <h3>{currentMember.name}</h3>
-                    <span className="badge">{currentMember.beers} Bier</span>
+                    <span className="badge">{currentMemberStats.beers} Bier</span>
                   </div>
 
                   <div className="mini-grid">
-                    <MiniInfo
-                      label="Offen"
-                      value={formatCHF(
-                        Math.max(
-                          0,
-                          currentMember.beers * data.pricePerBeer - currentMember.paidAmount
-                        )
-                      )}
-                    />
-                    <MiniInfo label="Bezahlt" value={formatCHF(currentMember.paidAmount)} />
-                    <MiniInfo
-                      label="Total"
-                      value={formatCHF(currentMember.beers * data.pricePerBeer)}
-                    />
+                    <MiniInfo label="Offen" value={formatCHF(currentMemberStats.open)} />
+                    <MiniInfo label="Bezahlt" value={formatCHF(currentMemberStats.paidAmount)} />
+                    <MiniInfo label="Total" value={formatCHF(currentMemberStats.total)} />
                   </div>
 
                   <div className="button-row">
@@ -390,14 +742,23 @@ export default function App() {
               <h2>Bestand & Zahlung</h2>
 
               <div className="info-box">
-                <div className="muted">Aktueller Bestand</div>
-                <div className="big-number">{data.stock}</div>
+                <div className="muted">Aktueller Gesamtbestand</div>
+                <div className="big-number">{totalStock}</div>
                 <div className="muted">Flaschen / Dosen</div>
               </div>
 
               <div className="info-box">
+                <div className="muted">Ausgewähltes Produkt</div>
+                <div className="big-text">{currentProduct?.name || "-"}</div>
+                <div className="muted">
+                  Preis {formatCHF(currentProduct?.price || 0)} · Bestand{" "}
+                  {currentProduct?.stock || 0}
+                </div>
+              </div>
+
+              <div className="info-box">
                 <div className="muted">TWINT an</div>
-                <div className="big-text">{TWINT_NUMBER}</div>
+                <div className="big-text">{settings.twintNumber || "-"}</div>
                 <div className="muted">
                   Nach Zahlung kann im Admin-Bereich als bezahlt markiert werden.
                 </div>
@@ -411,6 +772,15 @@ export default function App() {
             {!isAdminAuth ? (
               <div className="card admin-login">
                 <h2>Admin Login</h2>
+
+                <input
+                  type="email"
+                  className="input"
+                  placeholder="Admin E-Mail"
+                  value={adminEmail}
+                  onChange={(e) => setAdminEmail(e.target.value)}
+                />
+
                 <input
                   type="password"
                   className="input"
@@ -421,6 +791,7 @@ export default function App() {
                     if (e.key === "Enter") handleAdminLogin();
                   }}
                 />
+
                 <button className="btn full" onClick={handleAdminLogin}>
                   Login
                 </button>
@@ -430,7 +801,7 @@ export default function App() {
                 <div className="card">
                   <div className="section-head">
                     <h2>Mitglieder verwalten</h2>
-                    <button className="btn btn-outline" onClick={() => setIsAdminAuth(false)}>
+                    <button className="btn btn-outline" onClick={handleAdminLogout}>
                       Logout
                     </button>
                   </div>
@@ -451,17 +822,21 @@ export default function App() {
                   </div>
 
                   <div className="list">
-                    {data.members.map((member) => {
-                      const total = member.beers * data.pricePerBeer;
-                      const open = Math.max(0, total - member.paidAmount);
+                    {members.map((member) => {
+                      const stats = memberStatsMap[member.id] || {
+                        beers: 0,
+                        total: 0,
+                        paidAmount: 0,
+                        open: 0,
+                      };
 
                       return (
                         <div key={member.id} className="list-item">
                           <div>
                             <div className="member-name">{member.name}</div>
                             <div className="muted">
-                              {member.beers} Bier · Total {formatCHF(total)} · Offen{" "}
-                              {formatCHF(open)}
+                              {stats.beers} Bier · Total {formatCHF(stats.total)} · Offen{" "}
+                              {formatCHF(stats.open)}
                             </div>
                           </div>
 
@@ -493,24 +868,51 @@ export default function App() {
 
                 <div className="right-col">
                   <div className="card">
-                    <h2>Einstellungen</h2>
-                    <label className="label">Preis pro Bier (CHF)</label>
-                    <input
-                      type="number"
-                      step="0.1"
-                      className="input"
-                      value={data.pricePerBeer}
-                      onChange={(e) =>
-                        setData((prev) => ({
-                          ...prev,
-                          pricePerBeer: Number(e.target.value) || 0,
-                        }))
-                      }
-                    />
+                    <h2>Produkte / Preise</h2>
+
+                    {products.length === 0 ? (
+                      <p className="muted">Keine Produkte vorhanden.</p>
+                    ) : (
+                      <div className="list">
+                        {products.map((product) => (
+                          <div key={product.id} className="list-item">
+                            <div>
+                              <div className="member-name">{product.name}</div>
+                              <div className="muted">
+                                Bestand {product.stock || 0}
+                              </div>
+                            </div>
+
+                            <input
+                              type="number"
+                              step="0.1"
+                              className="input"
+                              defaultValue={product.price || 0}
+                              onBlur={(e) =>
+                                updateProductPrice(product.id, e.target.value)
+                              }
+                            />
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </div>
 
                   <div className="card">
                     <h2>Bestand verwalten</h2>
+
+                    <label className="label">Produkt</label>
+                    <select
+                      className="input"
+                      value={selectedProductId}
+                      onChange={(e) => setSelectedProductId(e.target.value)}
+                    >
+                      {products.map((product) => (
+                        <option key={product.id} value={product.id}>
+                          {product.name}
+                        </option>
+                      ))}
+                    </select>
 
                     <label className="label">Bestand erhöhen</label>
                     <input
@@ -546,8 +948,7 @@ export default function App() {
                   <div className="card">
                     <h2>Hinweis</h2>
                     <p className="muted">
-                      Die Daten werden lokal im Browser gespeichert. Für einen echten
-                      Mehrbenutzer-Betrieb bräuchte es später eine zentrale Datenbank.
+                      Diese Version nutzt Firebase. Alle Nutzer sehen dieselben Daten.
                     </p>
                   </div>
                 </div>
@@ -560,34 +961,38 @@ export default function App() {
           <div className="card">
             <h2>Verlauf</h2>
 
-            {data.transactions.length === 0 ? (
+            {transactions.length === 0 ? (
               <p className="muted">Noch keine Einträge vorhanden.</p>
             ) : (
               <div className="list">
-                {data.transactions.map((entry) => {
-                  const member = data.members.find((m) => m.id === entry.memberId);
-
-                  return (
-                    <div key={entry.id} className="list-item">
-                      <div>
-                        <div className="member-name">
-                          {entry.text}
-                          {member ? ` · ${member.name}` : ""}
-                        </div>
-                        <div className="muted">{entry.date}</div>
+                {transactions.map((entry) => (
+                  <div key={entry.id} className="list-item">
+                    <div>
+                      <div className="member-name">
+                        {entry.type === "purchase" && "Bier hinzugefügt"}
+                        {entry.type === "payment" && "Als bezahlt markiert"}
+                        {entry.type === "correction" && "Bier entfernt"}
+                        {entry.type === "reset" && "Konto zurückgesetzt"}
+                        {entry.type === "stock_add" && "Bestand erhöht"}
+                        {entry.type === "stock_remove" && "Bestand vermindert"}
+                        {entry.memberName ? ` · ${entry.memberName}` : ""}
+                        {entry.productName ? ` · ${entry.productName}` : ""}
                       </div>
-                      <div className="badge">
-                        {entry.type === "payment"
-                          ? `+ ${formatCHF(entry.amount)}`
-                          : entry.type === "beer"
-                          ? `${formatCHF(entry.amount)}`
-                          : entry.amount !== 0
-                          ? `${formatCHF(entry.amount)}`
-                          : "Info"}
-                      </div>
+                      <div className="muted">{formatDate(entry.createdAt)}</div>
                     </div>
-                  );
-                })}
+                    <div className="badge">
+                      {entry.type === "payment"
+                        ? `+ ${formatCHF(entry.total)}`
+                        : entry.type === "purchase"
+                        ? `${formatCHF(entry.total)}`
+                        : entry.type === "correction"
+                        ? `-${formatCHF(entry.total)}`
+                        : entry.total
+                        ? formatCHF(entry.total)
+                        : "Info"}
+                    </div>
+                  </div>
+                ))}
               </div>
             )}
           </div>
